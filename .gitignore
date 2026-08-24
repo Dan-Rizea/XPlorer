@@ -1,0 +1,38 @@
+# =======================================================
+# .NET / Visual Studio Build & Binary Ignores
+# =======================================================
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+.vs/
+*.user
+*.suo
+*.userprefs
+*.docstates
+
+# =======================================================
+# Chrome, ChromeDriver & Puppeteer Browser Binaries
+# =======================================================
+**/chrome-win64/
+**/chrome-win32/
+**/chrome-linux64/
+**/chrome-mac/
+**/chrome-mac-arm64/
+**/.local-chromium/
+**/chromedriver*
+**/chromedriver.exe
+**/chrome.exe
+**/chrome.dll
+**/BrowserData/
+**/app_data/
+
+# =======================================================
+# OS & Temporary Files
+# =======================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.tmp
+*.temp
