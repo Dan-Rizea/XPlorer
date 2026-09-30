@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
@@ -22,6 +23,9 @@ public partial class MainWindow : Window
     private bool _isSpying = false;
     private CancellationTokenSource _delayCts;
     private SavedElementItem _selectedElement;
+    private readonly ConcurrentDictionary<IPage, bool> _inspectorPages = new ConcurrentDictionary<IPage, bool>();
+    private int _spySession;
+    private bool _inspectorReady;
 
     public ObservableCollection<SavedElementItem> SavedElements { get; set; } = new ObservableCollection<SavedElementItem>();
 
@@ -50,6 +54,9 @@ public partial class MainWindow : Window
         public string XPath { get; set; }
         public string Css { get; set; }
         public bool IsShadowDom { get; set; }
+        public string FrameId { get; set; }
+        [JsonIgnore]
+        public IPage CapturedPage { get; set; }
 
         public event PropertyChangedEventHandler PropertyChanged;
         protected void OnPropertyChanged(string prop) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(prop));
@@ -64,6 +71,7 @@ public partial class MainWindow : Window
         public string Selenium { get; set; }
         public string Hierarchy { get; set; }
         public bool IsShadowDom { get; set; }
+        public string FrameId { get; set; }
         public Dictionary<string, string> Attributes { get; set; } = new Dictionary<string, string>();
     }
 
@@ -80,6 +88,12 @@ public partial class MainWindow : Window
         public string Message { get; set; }
         public decimal X { get; set; }
         public decimal Y { get; set; }
+    }
+
+    public class InspectorEvent
+    {
+        public string Capture { get; set; }
+        public bool Cancelled { get; set; }
     }
 
     public MainWindow()
@@ -99,22 +113,14 @@ public partial class MainWindow : Window
             _browser = await InitializeBrowserAsync();
 
             var pages = await _browser.PagesAsync();
-            IPage activePage = null;
-            if (pages.Length == 0)
-            {
-                activePage = await _browser.NewPageAsync();
-            }
-            else
-            {
-                activePage = pages.LastOrDefault(p => !p.IsClosed) ?? pages.FirstOrDefault();
-            }
+            IPage activePage = pages.FirstOrDefault(IsInspectableWebPage) ?? await _browser.NewPageAsync();
 
             if (activePage != null)
             {
                 await EnsureBrowserWindowVisibleAsync(activePage);
             }
 
-            // Hook browser target events so if user opens new pages while spying, we inject into them
+            // Hook browser target events so if user opens new pages while spying, we inject into them (ignoring DevTools internal pages)
             _browser.TargetCreated += async (s, ev) =>
             {
                 if (_isSpying)
@@ -122,10 +128,13 @@ public partial class MainWindow : Window
                     try
                     {
                         var target = ev.Target;
-                        var page = await target.PageAsync();
-                        if (page != null)
+                        if (target != null && target.Type == TargetType.Page)
                         {
-                            await SetupPageForSpyingAsync(page);
+                            var page = await target.PageAsync();
+                            if (page != null && IsInspectableWebPage(page))
+                            {
+                                await SetupPageForSpyingAsync(page);
+                            }
                         }
                     }
                     catch { }
@@ -184,6 +193,9 @@ public partial class MainWindow : Window
                 {
                     "--remote-debugging-port=9222",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-site-isolation-trials",
+                    "--disable-features=IsolateOrigins,site-per-process",
                     "--start-maximized"
                 },
                 IgnoreDefaultArgs = false
@@ -211,6 +223,9 @@ public partial class MainWindow : Window
                     {
                         "--remote-debugging-port=9222",
                         "--disable-blink-features=AutomationControlled",
+                        "--disable-web-security",
+                        "--disable-site-isolation-trials",
+                        "--disable-features=IsolateOrigins,site-per-process",
                         "--start-maximized"
                     }
                 });
@@ -218,20 +233,58 @@ public partial class MainWindow : Window
         }
     }
 
+    private static bool IsInspectableWebPage(IPage page)
+    {
+        if (page == null || page.IsClosed) return false;
+        try
+        {
+            string url = page.Url ?? "";
+            if (string.IsNullOrWhiteSpace(url)) return true;
+            if (url.StartsWith("devtools://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("chrome-devtools://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("chrome://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("edge://", StringComparison.OrdinalIgnoreCase) ||
+                url.StartsWith("view-source:", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private async Task<IPage> GetActivePageAsync()
     {
-        if (_browser == null) return null;
-        var pages = await _browser.PagesAsync();
-        if (pages.Length == 0)
+        if (_browser == null || _browser.IsClosed) return null;
+        try
         {
+            var pages = await _browser.PagesAsync();
+            if (pages == null || pages.Length == 0)
+            {
+                return await _browser.NewPageAsync();
+            }
+
+            // Prefer the active/last opened genuine web page (excluding DevTools internal panels)
+            var validPages = pages.Where(IsInspectableWebPage).ToArray();
+            var openPage = validPages.LastOrDefault(p => !p.IsClosed);
+            if (openPage != null) return openPage;
+
+            // If only DevTools or closed pages exist, create/return an inspectable page
             return await _browser.NewPageAsync();
         }
-        return pages.LastOrDefault(p => !p.IsClosed) ?? pages.FirstOrDefault();
+        catch
+        {
+            return null;
+        }
     }
 
     private async Task EnsureBrowserWindowVisibleAsync(IPage page)
     {
-        if (page == null || page.IsClosed) return;
+        if (page == null || page.IsClosed || !IsInspectableWebPage(page)) return;
         try
         {
             await page.SetViewportAsync(null);
@@ -358,6 +411,8 @@ public partial class MainWindow : Window
         try
         {
             _isSpying = true;
+            _spySession++;
+            _inspectorReady = true;
 
             // Update UI state to Cancel mode
             if (SpyIcon != null)
@@ -370,25 +425,27 @@ public partial class MainWindow : Window
                 SpyButton.Background = new SolidColorBrush(Color.FromRgb(239, 68, 68)); // Red
                 SpyButton.ToolTip = "Cancel Indicating (ESC)";
             }
-            StatusTextBlock.Text = "Click any element to save and inspect (or ESC)...";
             StatusDot.Fill = new SolidColorBrush(Color.FromRgb(255, 152, 0)); // Orange
+            StatusTextBlock.Text = "Hover; Alt+Wheel/Tab: layers; Up/Down: parent/child; click to save.";
 
             var pages = await _browser.PagesAsync();
-            if (pages.Length == 0)
+            var validPages = pages.Where(IsInspectableWebPage).ToArray();
+            if (validPages.Length == 0)
             {
                 var newPage = await _browser.NewPageAsync();
-                pages = new[] { newPage };
+                validPages = new[] { newPage };
             }
 
-            // Bring active page to front
-            var activePage = pages.LastOrDefault(p => !p.IsClosed) ?? pages.First();
+            // Bring active inspected web page to front
+            var activePage = validPages.LastOrDefault(p => !p.IsClosed) ?? validPages.First();
             try { await activePage.BringToFrontAsync(); } catch { }
 
-            // Inject into all open pages
-            foreach (var page in pages.Where(p => !p.IsClosed))
+            // Inject only into genuine open web pages (skip devtools)
+            foreach (var page in validPages.Where(p => !p.IsClosed))
             {
                 await SetupPageForSpyingAsync(page);
             }
+            _ = PollInspectorEventsAsync(_spySession);
         }
         catch (Exception ex)
         {
@@ -399,48 +456,99 @@ public partial class MainWindow : Window
 
     private async Task SetupPageForSpyingAsync(IPage page)
     {
-        if (page == null || page.IsClosed) return;
+        if (!_inspectorReady || page == null || page.IsClosed || !IsInspectableWebPage(page)) return;
 
         try
         {
-            // Expose C# functions if not already exposed
-            try
+            if (_inspectorPages.TryAdd(page, true))
             {
-                await page.ExposeFunctionAsync("onElementSelected", new Func<string, bool>(jsonProps =>
+                page.FrameNavigated += async (sender, args) =>
                 {
-                    Dispatcher.Invoke(new Action(async () =>
-                    {
-                        await StopSpyingAsync(userCancelled: false);
-                        ProcessCapturedElement(jsonProps);
-                    }));
-                    return true;
-                }));
-            }
-            catch { /* Already exposed on this page instance */ }
-
-            try
-            {
-                await page.ExposeFunctionAsync("onSpyCancelled", new Func<bool>(() =>
+                    if (_inspectorReady) await SetupFrameForSpyingAsync(args.Frame, _spySession);
+                };
+                page.FrameAttached += async (sender, args) =>
                 {
-                    Dispatcher.Invoke(new Action(async () =>
-                    {
-                        await StopSpyingAsync(userCancelled: true);
-                    }));
-                    return true;
-                }));
+                    if (_inspectorReady) await SetupFrameForSpyingAsync(args.Frame, _spySession);
+                };
+                page.Close += (sender, args) => _inspectorPages.TryRemove(page, out _);
             }
-            catch { /* Already exposed on this page instance */ }
 
-            // Inject the inspector client script
-            string inspectorJs = GetInspectorScript();
-            await page.EvaluateExpressionAsync(inspectorJs);
+            // DevTools' #document nodes belong to separate execution contexts, including
+            // cross-origin and nested frames. Install locally rather than piercing from the top.
+            int session = _spySession;
+            await Task.WhenAll(page.Frames.Select(frame => SetupFrameForSpyingAsync(frame, session)));
         }
         catch { }
+    }
+
+    private async Task SetupFrameForSpyingAsync(IFrame frame, int session)
+    {
+        if (!_inspectorReady || session != _spySession || frame.Detached) return;
+        try
+        {
+            string script = GetInspectorScript();
+            await WithInspectorTimeoutAsync(frame.EvaluateExpressionAsync(
+                "window._uiExpFrameId = " + JsonConvert.SerializeObject(frame.Id) + ";\n" +
+                "window._uiExpSession = " + session + ";\n" + script));
+            // A cancellation/capture can happen while evaluation is in flight.
+            if (!_inspectorReady || session != _spySession)
+                await WithInspectorTimeoutAsync(frame.EvaluateExpressionAsync("if (window._uiExpSession === " + session + " && window._uiExpCleanup) window._uiExpCleanup();"));
+        }
+        catch { /* A frame may detach or replace its execution context during navigation. */ }
+    }
+
+    private static async Task WithInspectorTimeoutAsync(Task task)
+    {
+        if (await Task.WhenAny(task, Task.Delay(1000)) != task)
+        {
+            // Context replacement can leave an old Puppeteer evaluation pending forever.
+            _ = task.ContinueWith(t => { var observed = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+            throw new TimeoutException("The frame execution context is changing.");
+        }
+        await task;
+    }
+
+    private async Task PollInspectorEventsAsync(int session)
+    {
+        while (_inspectorReady && session == _spySession)
+        {
+            try
+            {
+                var pages = await _browser.PagesAsync();
+                foreach (var page in pages.Where(IsInspectableWebPage))
+                {
+                    var events = await Task.WhenAll(page.Frames.Select(async frame =>
+                    {
+                        try
+                        {
+                            var read = frame.EvaluateExpressionAsync<InspectorEvent>(@"({
+                                Capture: window._uiExpCapture || null,
+                                Cancelled: !!window._uiExpCancelled
+                            })");
+                            await WithInspectorTimeoutAsync(read);
+                            return await read;
+                        }
+                        catch { return null; }
+                    }));
+                    if (!_inspectorReady || session != _spySession) return;
+                    var result = events.FirstOrDefault(ev => ev != null && (ev.Capture != null || ev.Cancelled));
+                    if (result != null)
+                    {
+                        await StopSpyingAsync(userCancelled: result.Capture == null);
+                        if (result.Capture != null) ProcessCapturedElement(result.Capture, page);
+                        return;
+                    }
+                }
+            }
+            catch { /* The browser can close while indication is active. */ }
+            await Task.Delay(100);
+        }
     }
 
     private async Task StopSpyingAsync(bool userCancelled = false)
     {
         _isSpying = false;
+        _inspectorReady = false;
 
         if (_delayCts != null)
         {
@@ -458,7 +566,7 @@ public partial class MainWindow : Window
             if (SpyButton != null)
             {
                 SpyButton.Background = new SolidColorBrush(Color.FromRgb(255, 255, 255)); // White
-                SpyButton.ToolTip = "Indicate Element on Webpage";
+                SpyButton.ToolTip = "Indicate Element: Alt+Wheel or Tab cycles layers; Up/Down selects parent/child; Click or Enter captures; Esc cancels.";
             }
 
             if (userCancelled)
@@ -489,14 +597,17 @@ public partial class MainWindow : Window
                 ";
                 foreach (var page in pages.Where(p => !p.IsClosed))
                 {
-                    try { await page.EvaluateExpressionAsync(cleanupJs); } catch { }
+                    foreach (var frame in page.Frames)
+                    {
+                        try { await WithInspectorTimeoutAsync(frame.EvaluateExpressionAsync(cleanupJs)); } catch { }
+                    }
                 }
             }
             catch { }
         }
     }
 
-    private void ProcessCapturedElement(string json)
+    private void ProcessCapturedElement(string json, IPage capturedPage)
     {
         try
         {
@@ -541,7 +652,9 @@ public partial class MainWindow : Window
                 Hierarchy = result.Hierarchy ?? "",
                 XPath = result.XPath ?? "",
                 Css = result.Css ?? "",
-                IsShadowDom = result.IsShadowDom
+                IsShadowDom = result.IsShadowDom,
+                FrameId = result.FrameId,
+                CapturedPage = capturedPage
             };
 
             SavedElements.Add(newItem);
@@ -698,31 +811,63 @@ public partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    private void FocusProcessWindow(int processId)
+    {
+        if (processId <= 0) return;
+
+        EnumWindows((hWnd, lParam) =>
+        {
+            if (IsWindowVisible(hWnd))
+            {
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid == processId)
+                {
+                    if (IsIconic(hWnd))
+                    {
+                        ShowWindow(hWnd, 9); // SW_RESTORE
+                    }
+                    SetForegroundWindow(hWnd);
+                    return false; // Found window, stop enumeration
+                }
+            }
+            return true;
+        }, IntPtr.Zero);
+    }
+
     private async void ChromeButton_Click(object sender, RoutedEventArgs e)
     {
         try
         {
+            if (_browser == null || _browser.IsClosed)
+            {
+                StatusTextBlock.Text = "Reconnecting to browser...";
+                StatusDot.Fill = new SolidColorBrush(Color.FromRgb(255, 193, 7));
+                _browser = await InitializeBrowserAsync();
+            }
+
             var page = await GetActivePageAsync();
-            if (page != null)
+            if (page != null && !page.IsClosed)
             {
                 await EnsureBrowserWindowVisibleAsync(page);
             }
 
-            // Find browser window processes and restore + foreground them
-            var procs = System.Diagnostics.Process.GetProcessesByName("chrome")
-                .Concat(System.Diagnostics.Process.GetProcessesByName("msedge"))
-                .Concat(System.Diagnostics.Process.GetProcessesByName("chromium"));
-
-            foreach (var proc in procs)
+            // Restore and foreground only the specific browser instance managed by XPlorer
+            int browserPid = _browser?.Process?.Id ?? 0;
+            if (browserPid > 0)
             {
-                if (proc.MainWindowHandle != IntPtr.Zero)
-                {
-                    if (IsIconic(proc.MainWindowHandle))
-                    {
-                        ShowWindow(proc.MainWindowHandle, 9); // SW_RESTORE
-                    }
-                    SetForegroundWindow(proc.MainWindowHandle);
-                }
+                FocusProcessWindow(browserPid);
             }
 
             StatusTextBlock.Text = "Chrome browser brought to forefront.";
@@ -731,6 +876,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             StatusTextBlock.Text = "Could not activate Chrome: " + ex.Message;
+            StatusDot.Fill = new SolidColorBrush(Color.FromRgb(244, 67, 54));
         }
     }
 
@@ -838,6 +984,21 @@ public partial class MainWindow : Window
         return (xpath, css);
     }
 
+    private Task<IPage> GetActionPageAsync()
+    {
+        return _selectedElement?.CapturedPage != null
+            ? Task.FromResult(_selectedElement.CapturedPage)
+            : GetActivePageAsync();
+    }
+
+    private IFrame GetActionFrame(IPage page)
+    {
+        if (string.IsNullOrEmpty(_selectedElement?.FrameId)) return page.MainFrame;
+        var frame = page.Frames.FirstOrDefault(f => f.Id == _selectedElement.FrameId && !f.Detached);
+        if (frame == null) throw new InvalidOperationException("The captured frame is no longer available. Indicate the element again.");
+        return frame;
+    }
+
     private async Task ExecuteActionInBrowserAsync(string actionName, string jsFunction)
     {
         var (xpath, css) = GetActiveSelectors();
@@ -848,7 +1009,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var page = await GetActivePageAsync();
+        var page = await GetActionPageAsync();
         if (page == null || page.IsClosed)
         {
             StatusTextBlock.Text = "❌ No active browser tab found.";
@@ -862,7 +1023,7 @@ public partial class MainWindow : Window
             StatusTextBlock.Text = $"Executing {actionName} on '{targetName}'...";
             StatusDot.Fill = new SolidColorBrush(Color.FromRgb(255, 193, 7));
 
-            var resultJson = await page.EvaluateFunctionAsync<string>(jsFunction, xpath, css);
+            var resultJson = await GetActionFrame(page).EvaluateFunctionAsync<string>(jsFunction, xpath, css);
             var result = JsonConvert.DeserializeObject<ActionResult>(resultJson);
 
             if (result.Success)
@@ -887,21 +1048,15 @@ public partial class MainWindow : Window
     {
         string js = @"(xpath, css) => {
             function findDeep(sel) {
-                function search(root) {
-                    try {
-                        let el = root.querySelector(sel);
-                        if (el) return el;
-                    } catch(e) {}
-                    let all = root.querySelectorAll('*');
-                    for (let n of all) {
-                        if (n.shadowRoot) {
-                            let found = search(n.shadowRoot);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
+                // The >>> segments explicitly identify each shadow host, including nested roots.
+                let root = document;
+                let el = null;
+                for (const part of sel.split(' >>> ')) {
+                    el = root.querySelector(part);
+                    if (!el) return null;
+                    root = el.shadowRoot;
                 }
-                return search(document);
+                return el;
             }
 
             let el = null;
@@ -916,7 +1071,7 @@ public partial class MainWindow : Window
             
             if (!el && css) {
                 try {
-                    let list = document.querySelectorAll(css);
+                    let list = css.includes(' >>> ') ? [findDeep(css)].filter(Boolean) : document.querySelectorAll(css);
                     count = list.length;
                     if (count > 0) el = list[0];
                     if (!el) {
@@ -925,6 +1080,8 @@ public partial class MainWindow : Window
                     }
                 } catch(e) {}
             }
+
+            if (el && el.nodeType === 9) el = el.documentElement;
 
             if (!el || count === 0) {
                 return JSON.stringify({ success: false, message: '0 elements match selector.', matchCount: 0 });
@@ -958,21 +1115,15 @@ public partial class MainWindow : Window
     {
         string js = @"(xpath, css) => {
             function findDeep(sel) {
-                function search(root) {
-                    try {
-                        let el = root.querySelector(sel);
-                        if (el) return el;
-                    } catch(e) {}
-                    let all = root.querySelectorAll('*');
-                    for (let n of all) {
-                        if (n.shadowRoot) {
-                            let found = search(n.shadowRoot);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
+                // The >>> segments explicitly identify each shadow host, including nested roots.
+                let root = document;
+                let el = null;
+                for (const part of sel.split(' >>> ')) {
+                    el = root.querySelector(part);
+                    if (!el) return null;
+                    root = el.shadowRoot;
                 }
-                return search(document);
+                return el;
             }
 
             let el = null;
@@ -983,8 +1134,10 @@ public partial class MainWindow : Window
                 } catch(e) {}
             }
             if (!el && css) {
-                try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                try { el = findDeep(css); } catch(e) {}
             }
+
+            if (el && el.nodeType === 9) el = el.documentElement;
 
             if (!el) return JSON.stringify({ success: false, message: 'Element not found to click.' });
 
@@ -1012,7 +1165,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var page = await GetActivePageAsync();
+        var page = await GetActionPageAsync();
         if (page == null || page.IsClosed)
         {
             StatusTextBlock.Text = "❌ No active browser tab found.";
@@ -1027,21 +1180,15 @@ public partial class MainWindow : Window
 
             string js = @"async (xpath, css) => {
                 function findDeep(sel) {
-                    function search(root) {
-                        try {
-                            let el = root.querySelector(sel);
-                            if (el) return el;
-                        } catch(e) {}
-                        let all = root.querySelectorAll('*');
-                        for (let n of all) {
-                            if (n.shadowRoot) {
-                                let found = search(n.shadowRoot);
-                                if (found) return found;
-                            }
-                        }
-                        return null;
+                    // The >>> segments explicitly identify each shadow host, including nested roots.
+                    let root = document;
+                    let el = null;
+                    for (const part of sel.split(' >>> ')) {
+                        el = root.querySelector(part);
+                        if (!el) return null;
+                        root = el.shadowRoot;
                     }
-                    return search(document);
+                    return el;
                 }
 
                 let el = null;
@@ -1052,8 +1199,10 @@ public partial class MainWindow : Window
                     } catch(e) {}
                 }
                 if (!el && css) {
-                    try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                    try { el = findDeep(css); } catch(e) {}
                 }
+
+                if (el && el.nodeType === 9) el = el.documentElement;
 
                 if (!el) return JSON.stringify({ success: false, message: 'Element not found to hover.' });
 
@@ -1096,16 +1245,42 @@ public partial class MainWindow : Window
                 });
             }";
 
-            var resultJson = await page.EvaluateFunctionAsync<string>(js, xpath, css);
+            var resultJson = await GetActionFrame(page).EvaluateFunctionAsync<string>(js, xpath, css);
             var result = JsonConvert.DeserializeObject<HoverActionResult>(resultJson);
 
             if (result != null && result.Success)
             {
+                // Puppeteer's element box is expressed in top-level coordinates,
+                // including nested/cross-origin frame offsets. Native pointer movement
+                // is required for CSS :hover; dispatching events alone is insufficient.
+                var handle = await GetActionFrame(page).EvaluateFunctionHandleAsync(@"(xpath, css) => {
+                    let el = null;
+                    if (xpath) {
+                        try { el = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (_) {}
+                    }
+                    if (!el && css) {
+                        let root = document;
+                        for (const part of css.split(' >>> ')) {
+                            el = root.querySelector(part);
+                            if (!el) return null;
+                            root = el.shadowRoot;
+                        }
+                    }
+                    return el && el.nodeType === 9 ? el.documentElement : el;
+                }", xpath, css);
                 try
                 {
-                    await page.Mouse.MoveAsync(result.X, result.Y);
+                    if (handle is IElementHandle element)
+                    {
+                        var box = await element.BoundingBoxAsync();
+                        if (box != null)
+                        {
+                            await page.BringToFrontAsync();
+                            await page.Mouse.MoveAsync(box.X + box.Width / 2, box.Y + box.Height / 2);
+                        }
+                    }
                 }
-                catch { }
+                finally { await handle.DisposeAsync(); }
 
                 StatusTextBlock.Text = $"✅ {result.Message}";
                 StatusDot.Fill = new SolidColorBrush(Color.FromRgb(34, 197, 94));
@@ -1127,21 +1302,15 @@ public partial class MainWindow : Window
     {
         string js = @"(xpath, css) => {
             function findDeep(sel) {
-                function search(root) {
-                    try {
-                        let el = root.querySelector(sel);
-                        if (el) return el;
-                    } catch(e) {}
-                    let all = root.querySelectorAll('*');
-                    for (let n of all) {
-                        if (n.shadowRoot) {
-                            let found = search(n.shadowRoot);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
+                // The >>> segments explicitly identify each shadow host, including nested roots.
+                let root = document;
+                let el = null;
+                for (const part of sel.split(' >>> ')) {
+                    el = root.querySelector(part);
+                    if (!el) return null;
+                    root = el.shadowRoot;
                 }
-                return search(document);
+                return el;
             }
 
             let el = null;
@@ -1152,13 +1321,81 @@ public partial class MainWindow : Window
                 } catch(e) {}
             }
             if (!el && css) {
-                try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                try { el = findDeep(css); } catch(e) {}
             }
 
-            if (!el) return JSON.stringify({ success: false, message: 'Element not found to scroll into view.' });
+            if (el && el.nodeType === 9) el = el.documentElement;
 
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return JSON.stringify({ success: true, message: 'Scrolled <' + el.tagName.toLowerCase() + '> into view.' });
+            if (!el) return JSON.stringify({ success: false, message: 'Element not found on page to scroll to.' });
+
+            // Target element to scroll - if SVG child, use its parent element
+            let scrollTarget = el;
+            if (scrollTarget instanceof SVGElement && !(scrollTarget instanceof SVGSVGElement)) {
+                scrollTarget = scrollTarget.closest('svg') || scrollTarget.parentElement || scrollTarget;
+            }
+
+            // 1. Scroll any scrollable parent containers (divs with overflow: auto/scroll)
+            let parent = scrollTarget.parentElement;
+            while (parent && parent !== document.body && parent !== document.documentElement) {
+                let style = window.getComputedStyle(parent);
+                let overflowY = style.overflowY || style.overflow;
+                let overflowX = style.overflowX || style.overflow;
+                let isScrollableY = (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') && parent.scrollHeight > parent.clientHeight;
+                let isScrollableX = (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') && parent.scrollWidth > parent.clientWidth;
+
+                if (isScrollableY || isScrollableX) {
+                    let parentRect = parent.getBoundingClientRect();
+                    let elRect = scrollTarget.getBoundingClientRect();
+                    if (isScrollableY) {
+                        let targetScrollTop = parent.scrollTop + (elRect.top - parentRect.top) - (parent.clientHeight / 2) + (elRect.height / 2);
+                        parent.scrollTo({ top: targetScrollTop, behavior: 'smooth' });
+                    }
+                    if (isScrollableX) {
+                        let targetScrollLeft = parent.scrollLeft + (elRect.left - parentRect.left) - (parent.clientWidth / 2) + (elRect.width / 2);
+                        parent.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
+                    }
+                }
+                parent = parent.parentElement;
+            }
+
+            // 2. Standard and fallback window scrolling
+            try {
+                scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+            } catch(e) {
+                try {
+                    scrollTarget.scrollIntoView(true);
+                } catch(e2) {}
+            }
+
+            // 3. Fallback absolute window coordinate scroll if window did not center it
+            let rect = scrollTarget.getBoundingClientRect();
+            let absoluteY = window.pageYOffset + rect.top - (window.innerHeight / 2) + (rect.height / 2);
+            let absoluteX = window.pageXOffset + rect.left - (window.innerWidth / 2) + (rect.width / 2);
+            if (Math.abs(rect.top - window.innerHeight / 2) > 100) {
+                try {
+                    window.scrollTo({ top: Math.max(0, absoluteY), left: Math.max(0, absoluteX), behavior: 'smooth' });
+                } catch(e) {}
+            }
+
+            // 4. Flash visual amber highlight glow so the user sees exactly where the element is
+            let origOutline = el.style.outline;
+            let origBoxShadow = el.style.boxShadow;
+            let origTransition = el.style.transition;
+            el.style.transition = 'all 0.2s ease-in-out';
+            el.style.outline = '3px solid #F59E0B';
+            el.style.boxShadow = '0 0 20px rgba(245, 158, 11, 0.8)';
+            setTimeout(() => {
+                el.style.outline = origOutline;
+                el.style.boxShadow = origBoxShadow;
+                el.style.transition = origTransition;
+            }, 1800);
+
+            let tag = el.tagName.toLowerCase();
+            let idAttr = el.id ? '#' + el.id : '';
+            return JSON.stringify({
+                success: true,
+                message: 'Scrolled <' + tag + idAttr + '> into center view.'
+            });
         }";
 
         await ExecuteActionInBrowserAsync("Scroll To", js);
@@ -1168,21 +1405,15 @@ public partial class MainWindow : Window
     {
         string js = @"(xpath, css) => {
             function findDeep(sel) {
-                function search(root) {
-                    try {
-                        let el = root.querySelector(sel);
-                        if (el) return el;
-                    } catch(e) {}
-                    let all = root.querySelectorAll('*');
-                    for (let n of all) {
-                        if (n.shadowRoot) {
-                            let found = search(n.shadowRoot);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
+                // The >>> segments explicitly identify each shadow host, including nested roots.
+                let root = document;
+                let el = null;
+                for (const part of sel.split(' >>> ')) {
+                    el = root.querySelector(part);
+                    if (!el) return null;
+                    root = el.shadowRoot;
                 }
-                return search(document);
+                return el;
             }
 
             let el = null;
@@ -1193,8 +1424,10 @@ public partial class MainWindow : Window
                 } catch(e) {}
             }
             if (!el && css) {
-                try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                try { el = findDeep(css); } catch(e) {}
             }
+
+            if (el && el.nodeType === 9) el = el.documentElement;
 
             if (!el) return JSON.stringify({ success: false, message: 'Element not found.' });
 
@@ -1298,7 +1531,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var page = await GetActivePageAsync();
+        var page = await GetActionPageAsync();
         if (page == null || page.IsClosed)
         {
             StatusTextBlock.Text = "❌ No active browser tab found.";
@@ -1313,21 +1546,15 @@ public partial class MainWindow : Window
 
             string js = @"(xpath, css, text) => {
                 function findDeep(sel) {
-                    function search(root) {
-                        try {
-                            let el = root.querySelector(sel);
-                            if (el) return el;
-                        } catch(e) {}
-                        let all = root.querySelectorAll('*');
-                        for (let n of all) {
-                            if (n.shadowRoot) {
-                                let found = search(n.shadowRoot);
-                                if (found) return found;
-                            }
-                        }
-                        return null;
+                    // The >>> segments explicitly identify each shadow host, including nested roots.
+                    let root = document;
+                    let el = null;
+                    for (const part of sel.split(' >>> ')) {
+                        el = root.querySelector(part);
+                        if (!el) return null;
+                        root = el.shadowRoot;
                     }
-                    return search(document);
+                    return el;
                 }
 
                 let el = null;
@@ -1338,8 +1565,10 @@ public partial class MainWindow : Window
                     } catch(e) {}
                 }
                 if (!el && css) {
-                    try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                    try { el = findDeep(css); } catch(e) {}
                 }
+
+                if (el && el.nodeType === 9) return JSON.stringify({ success: false, message: 'Select an input or editable element; a #document cannot accept text-input actions.' });
 
                 if (!el) return JSON.stringify({ success: false, message: 'Element not found to type into.' });
 
@@ -1360,7 +1589,7 @@ public partial class MainWindow : Window
                 return JSON.stringify({ success: true, message: 'Typed ""' + text + '"" into <' + el.tagName.toLowerCase() + '>.' });
             }";
 
-            var resultJson = await page.EvaluateFunctionAsync<string>(js, xpath, css, textToType);
+            var resultJson = await GetActionFrame(page).EvaluateFunctionAsync<string>(js, xpath, css, textToType);
             var result = JsonConvert.DeserializeObject<ActionResult>(resultJson);
 
             if (result.Success)
@@ -1385,21 +1614,15 @@ public partial class MainWindow : Window
     {
         string js = @"(xpath, css) => {
             function findDeep(sel) {
-                function search(root) {
-                    try {
-                        let el = root.querySelector(sel);
-                        if (el) return el;
-                    } catch(e) {}
-                    let all = root.querySelectorAll('*');
-                    for (let n of all) {
-                        if (n.shadowRoot) {
-                            let found = search(n.shadowRoot);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
+                // The >>> segments explicitly identify each shadow host, including nested roots.
+                let root = document;
+                let el = null;
+                for (const part of sel.split(' >>> ')) {
+                    el = root.querySelector(part);
+                    if (!el) return null;
+                    root = el.shadowRoot;
                 }
-                return search(document);
+                return el;
             }
 
             let el = null;
@@ -1410,8 +1633,10 @@ public partial class MainWindow : Window
                 } catch(e) {}
             }
             if (!el && css) {
-                try { el = document.querySelector(css) || findDeep(css); } catch(e) {}
+                try { el = findDeep(css); } catch(e) {}
             }
+
+            if (el && el.nodeType === 9) return JSON.stringify({ success: false, message: 'Select an input or editable element; a #document cannot accept text-input actions.' });
 
             if (!el) return JSON.stringify({ success: false, message: 'Element not found to clear.' });
 
@@ -1435,413 +1660,10 @@ public partial class MainWindow : Window
 
     private string GetInspectorScript()
     {
-        return @"
-        (function() {
-            if (window._uiExpActive) {
-                if (window._uiExpCleanup) window._uiExpCleanup();
-            }
-            window._uiExpActive = true;
-
-            // Create highlight overlay element
-            let overlay = document.getElementById('_ui_exp_overlay');
-            if (!overlay) {
-                overlay = document.createElement('div');
-                overlay.id = '_ui_exp_overlay';
-                overlay.style.cssText = 'position:fixed; z-index:2147483647; pointer-events:none; border:2px solid #FF1744; background:rgba(255,23,68,0.18); box-sizing:border-box; transition:all 0.04s ease; display:none; border-radius:3px;';
-                
-                let badge = document.createElement('div');
-                badge.id = '_ui_exp_badge';
-                badge.style.cssText = 'position:absolute; top:-26px; left:0; background:#FF1744; color:#fff; font-family:Consolas,monospace; font-size:11px; font-weight:bold; padding:2px 8px; border-radius:3px 3px 0 0; white-space:nowrap; box-shadow:0 2px 5px rgba(0,0,0,0.3); pointer-events:none;';
-                overlay.appendChild(badge);
-                
-                (document.body || document.documentElement).appendChild(overlay);
-            }
-
-            let lastHovered = null;
-
-            // Shadow DOM piercing elementFromPoint
-            function getDeepElement(x, y) {
-                let el = document.elementFromPoint(x, y);
-                while (el && el.shadowRoot) {
-                    let inner = el.shadowRoot.elementFromPoint(x, y);
-                    if (!inner || inner === el) break;
-                    el = inner;
-                }
-                return el;
-            }
-
-            function isInsideShadowRoot(el) {
-                let root = el.getRootNode ? el.getRootNode() : null;
-                return root && root instanceof ShadowRoot;
-            }
-
-            function getShadowHost(el) {
-                let root = el.getRootNode ? el.getRootNode() : null;
-                return (root && root instanceof ShadowRoot) ? root.host : null;
-            }
-
-            function updateOverlay(el) {
-                if (!el || el === overlay || el === document.body || el === document.documentElement) {
-                    overlay.style.display = 'none';
-                    return;
-                }
-                let rect = el.getBoundingClientRect();
-                if (rect.width === 0 && rect.height === 0) {
-                    overlay.style.display = 'none';
-                    return;
-                }
-                overlay.style.display = 'block';
-                overlay.style.top = rect.top + 'px';
-                overlay.style.left = rect.left + 'px';
-                overlay.style.width = rect.width + 'px';
-                overlay.style.height = rect.height + 'px';
-
-                let badge = document.getElementById('_ui_exp_badge');
-                if (badge) {
-                    let idStr = el.id ? '#' + el.id : '';
-                    let clsStr = (typeof el.className === 'string' && el.className.trim()) 
-                        ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') 
-                        : '';
-                    let shadowStr = isInsideShadowRoot(el) ? ' [Shadow DOM]' : '';
-                    badge.innerText = el.tagName.toLowerCase() + idStr + clsStr + shadowStr + ' [' + Math.round(rect.width) + 'x' + Math.round(rect.height) + ']';
-                    if (rect.top < 28) {
-                        badge.style.top = '0px';
-                        badge.style.borderRadius = '0 0 3px 3px';
-                    } else {
-                        badge.style.top = '-24px';
-                        badge.style.borderRadius = '3px 3px 0 0';
-                    }
-                }
-            }
-
-            function isUniqueXPath(xpath, contextNode = document) {
-                try {
-                    let res = document.evaluate(xpath, contextNode, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                    return res.snapshotLength === 1;
-                } catch(e) {
-                    return false;
-                }
-            }
-
-            function generateXPath(el) {
-                if (!el || el.nodeType !== 1) return '';
-                let inShadow = isInsideShadowRoot(el);
-                let tag = el.tagName.toLowerCase();
-
-                // 1. By ID
-                if (el.id && !el.id.includes(' ') && !el.id.includes('""')) {
-                    let xpath = '//*[@id=""' + el.id + '""]';
-                    if (isUniqueXPath(xpath)) return xpath;
-                    let tagXpath = '//' + tag + '[@id=""' + el.id + '""]';
-                    if (isUniqueXPath(tagXpath)) return tagXpath;
-                }
-
-                // 2. By data-testid / data-test / data-qa
-                for (let attr of ['data-testid', 'data-test', 'data-qa', 'data-cy']) {
-                    let val = el.getAttribute(attr);
-                    if (val) {
-                        let xpath = '//*[@' + attr + '=""' + val + '""]';
-                        if (isUniqueXPath(xpath)) return xpath;
-                    }
-                }
-
-                // 3. By Name
-                if (el.name) {
-                    let xpath = '//' + tag + '[@name=""' + el.name + '""]';
-                    if (isUniqueXPath(xpath)) return xpath;
-                }
-
-                // 4. By Placeholder
-                let placeholder = el.getAttribute('placeholder');
-                if (placeholder) {
-                    let xpath = '//' + tag + '[@placeholder=""' + placeholder + '""]';
-                    if (isUniqueXPath(xpath)) return xpath;
-                }
-
-                // 5. By Aria-Label
-                let ariaLabel = el.getAttribute('aria-label');
-                if (ariaLabel) {
-                    let xpath = '//' + tag + '[@aria-label=""' + ariaLabel + '""]';
-                    if (isUniqueXPath(xpath)) return xpath;
-                }
-
-                // 6. By Text (for buttons, links, labels)
-                if (['button', 'a', 'label', 'h1', 'h2', 'h3', 'span', 'p'].includes(tag)) {
-                    let txt = (el.innerText || '').trim();
-                    if (txt && txt.length > 0 && txt.length < 50 && !txt.includes('""') && !txt.includes('\n')) {
-                        let xpath = '//' + tag + '[normalize-space()=""' + txt + '""]';
-                        if (isUniqueXPath(xpath)) return xpath;
-                    }
-                }
-
-                // 7. Hierarchical fallback
-                function getFullXPath(node) {
-                    if (!node || node.nodeType !== 1) return '';
-                    if (node === document.body) return '/html/body';
-                    if (node === document.documentElement) return '/html';
-                    
-                    let ix = 1;
-                    let siblings = node.parentNode ? node.parentNode.children : [];
-                    for (let i = 0; i < siblings.length; i++) {
-                        let sib = siblings[i];
-                        if (sib === node) {
-                            let parentXPath = getFullXPath(node.parentNode);
-                            return (parentXPath ? parentXPath + '/' : '/') + node.tagName.toLowerCase() + '[' + ix + ']';
-                        }
-                        if (sib.nodeType === 1 && sib.tagName === node.tagName) {
-                            ix++;
-                        }
-                    }
-                    return '';
-                }
-
-                let fullPath = getFullXPath(el);
-                if (inShadow) {
-                    return fullPath ? fullPath + ' [Inside Shadow Root]' : '//' + tag + ' [Inside Shadow Root]';
-                }
-                return fullPath;
-            }
-
-            function isUniqueCss(selector, root = document) {
-                try {
-                    return root.querySelectorAll(selector).length === 1;
-                } catch(e) {
-                    return false;
-                }
-            }
-
-            function generateCss(el) {
-                if (!el || el.nodeType !== 1) return '';
-                let inShadow = isInsideShadowRoot(el);
-                let host = getShadowHost(el);
-                let rootContext = inShadow && host && host.shadowRoot ? host.shadowRoot : document;
-                let tag = el.tagName.toLowerCase();
-
-                // 1. By ID
-                if (el.id && !el.id.includes(' ') && !/^\d/.test(el.id)) {
-                    let sel = '#' + CSS.escape(el.id);
-                    if (isUniqueCss(sel, rootContext)) {
-                        return inShadow && host ? generateCss(host) + ' >>> ' + sel : sel;
-                    }
-                }
-
-                // 2. By data-testid / name / aria-label
-                for (let attr of ['data-testid', 'data-test', 'name', 'placeholder', 'aria-label']) {
-                    let val = el.getAttribute(attr);
-                    if (val) {
-                        let sel = tag + '[' + attr + '=""' + CSS.escape(val) + '""]';
-                        if (isUniqueCss(sel, rootContext)) {
-                            return inShadow && host ? generateCss(host) + ' >>> ' + sel : sel;
-                        }
-                    }
-                }
-
-                // 3. By Class
-                if (typeof el.className === 'string' && el.className.trim()) {
-                    let classes = el.className.trim().split(/\s+/).filter(c => !c.includes(':') && !/^\d/.test(c));
-                    if (classes.length > 0) {
-                        let classSel = tag + '.' + classes.map(c => CSS.escape(c)).join('.');
-                        if (isUniqueCss(classSel, rootContext)) {
-                            return inShadow && host ? generateCss(host) + ' >>> ' + classSel : classSel;
-                        }
-                    }
-                }
-
-                // 4. Hierarchical path
-                function getFullCss(node) {
-                    if (!node || node.nodeType !== 1) return '';
-                    if (node === document.body) return 'body';
-                    if (node === document.documentElement) return 'html';
-                    
-                    let parent = node.parentElement;
-                    if (!parent) return node.tagName.toLowerCase();
-                    
-                    let siblings = Array.from(parent.children).filter(c => c.tagName === node.tagName);
-                    let index = siblings.indexOf(node) + 1;
-                    let nodeTag = node.tagName.toLowerCase() + (siblings.length > 1 ? ':nth-of-type(' + index + ')' : '');
-                    
-                    let parentSel = getFullCss(parent);
-                    return parentSel ? parentSel + ' > ' + nodeTag : nodeTag;
-                }
-
-                let localCss = getFullCss(el);
-                if (inShadow && host) {
-                    return generateCss(host) + ' >>> ' + localCss;
-                }
-                return localCss;
-            }
-
-            function onMouseMove(e) {
-                if (!window._uiExpActive) return;
-                let target = getDeepElement(e.clientX, e.clientY);
-                if (target && target !== lastHovered && target !== overlay && !overlay.contains(target)) {
-                    lastHovered = target;
-                    updateOverlay(target);
-                }
-            }
-
-            function onClick(e) {
-                if (!window._uiExpActive) return;
-                e.preventDefault();
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-
-                let target = lastHovered || getDeepElement(e.clientX, e.clientY);
-                if (!target || target === overlay || overlay.contains(target)) return;
-
-                let inShadow = isInsideShadowRoot(target);
-                let host = getShadowHost(target);
-
-                // Build element properties dictionary
-                let attrs = {};
-                attrs['Tag Name'] = target.tagName.toLowerCase();
-                if (inShadow) {
-                    let rootNode = target.getRootNode();
-                    attrs['Shadow Root'] = 'Inside Shadow DOM (mode: ' + (rootNode ? rootNode.mode : 'open') + ')';
-                    if (host) attrs['Shadow Host'] = '<' + host.tagName.toLowerCase() + (host.id ? '#' + host.id : '') + '>';
-                }
-                if (target.id) attrs['ID'] = target.id;
-                if (typeof target.className === 'string' && target.className.trim()) attrs['Class'] = target.className.trim();
-                if (target.name) attrs['Name'] = target.name;
-                if (target.type) attrs['Type'] = target.type;
-                if (target.value !== undefined && target.value !== '') attrs['Value'] = target.value;
-                if (target.getAttribute('placeholder')) attrs['Placeholder'] = target.getAttribute('placeholder');
-                if (target.getAttribute('aria-label')) attrs['Aria Label'] = target.getAttribute('aria-label');
-                if (target.getAttribute('role')) attrs['Role'] = target.getAttribute('role');
-                if (target.getAttribute('data-testid')) attrs['Data TestID'] = target.getAttribute('data-testid');
-                if (target.href) attrs['Href'] = target.href;
-                if (target.src) attrs['Src'] = target.src;
-                if (target.title) attrs['Title'] = target.title;
-
-                let txt = (target.innerText || '').trim();
-                if (txt) {
-                    attrs['Inner Text'] = txt.length > 150 ? txt.substring(0, 150) + '...' : txt;
-                }
-
-                let rect = target.getBoundingClientRect();
-                attrs['Bounding Box'] = Math.round(rect.x) + ', ' + Math.round(rect.y) + ' (' + Math.round(rect.width) + 'x' + Math.round(rect.height) + ')';
-
-                function generateHierarchy(node) {
-                    let path = [];
-                    let curr = node;
-                    while (curr) {
-                        if (curr.nodeType === 1) {
-                            let tag = curr.tagName.toLowerCase();
-                            let label = '<' + tag;
-                            if (curr.id) label += ' id=""' + curr.id + '""';
-                            if (curr.name) label += ' name=""' + curr.name + '""';
-                            if (curr.getAttribute('type')) label += ' type=""' + curr.getAttribute('type') + '""';
-                            if (curr.getAttribute('data-testid')) label += ' data-testid=""' + curr.getAttribute('data-testid') + '""';
-                            if (curr.className && typeof curr.className === 'string' && curr.className.trim()) {
-                                label += ' class=""' + curr.className.trim().split(/\s+/).slice(0, 2).join(' ') + '""';
-                            }
-                            label += '>';
-                            path.unshift(label);
-                        }
-
-                        if (curr.parentElement) {
-                            curr = curr.parentElement;
-                        } else {
-                            let root = curr.getRootNode ? curr.getRootNode() : null;
-                            if (root && root instanceof ShadowRoot) {
-                                path.unshift('#shadow-root (' + root.mode + ')');
-                                curr = root.host;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    return path.join(' ');
-                }
-
-                let xpath = generateXPath(target);
-                let css = generateCss(target);
-                let hierarchy = generateHierarchy(target);
-
-                // Playwright locator generation
-                let playwrightCode = '';
-                if (inShadow && host) {
-                    let hostCss = generateCss(host);
-                    let innerCss = target.id ? '#' + CSS.escape(target.id) : target.tagName.toLowerCase();
-                    playwrightCode = 'page.Locator(\""' + hostCss + '\"").Locator(\""' + innerCss + '\"")';
-                } else if (css) {
-                    playwrightCode = 'page.Locator(\""' + css + '\"")';
-                }
-
-                // Selenium code generation
-                let seleniumCode = '';
-                if (inShadow && host) {
-                    let hostCss = generateCss(host);
-                    let innerCss = target.id ? '#' + CSS.escape(target.id) : target.tagName.toLowerCase();
-                    seleniumCode = 'driver.FindElement(By.CssSelector(\""' + hostCss + '\"")).GetShadowRoot().FindElement(By.CssSelector(\""' + innerCss + '\""))';
-                }
-
-                let payload = {
-                    TagName: target.tagName,
-                    XPath: xpath,
-                    Css: css,
-                    Playwright: playwrightCode,
-                    Selenium: seleniumCode,
-                    Hierarchy: hierarchy,
-                    IsShadowDom: inShadow,
-                    Attributes: attrs
-                };
-
-                window._uiExpCleanup();
-
-                if (window.onElementSelected) {
-                    window.onElementSelected(JSON.stringify(payload));
-                }
-            }
-
-            function blockEvent(e) {
-                if (!window._uiExpActive) return;
-                e.preventDefault();
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-            }
-
-            let interceptedEvents = ['mousedown', 'mouseup', 'pointerdown', 'pointerup', 'dblclick', 'contextmenu'];
-
-            function onKeyDown(e) {
-                if (!window._uiExpActive) return;
-                if (e.key === 'Escape' || e.keyCode === 27) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    window._uiExpCleanup();
-                    if (window.onSpyCancelled) {
-                        window.onSpyCancelled();
-                    }
-                }
-            }
-
-            window._uiExpCleanup = function() {
-                window._uiExpActive = false;
-                document.removeEventListener('mousemove', onMouseMove, true);
-                document.removeEventListener('click', onClick, true);
-                window.removeEventListener('click', onClick, true);
-                document.removeEventListener('keydown', onKeyDown, true);
-
-                interceptedEvents.forEach(evt => {
-                    document.removeEventListener(evt, blockEvent, true);
-                    window.removeEventListener(evt, blockEvent, true);
-                });
-
-                if (overlay) {
-                    overlay.style.display = 'none';
-                }
-            };
-
-            interceptedEvents.forEach(evt => {
-                document.addEventListener(evt, blockEvent, true);
-                window.addEventListener(evt, blockEvent, true);
-            });
-
-            document.addEventListener('mousemove', onMouseMove, true);
-            document.addEventListener('click', onClick, true);
-            window.addEventListener('click', onClick, true);
-            document.addEventListener('keydown', onKeyDown, true);
-        })();
-        ";
+        using (var stream = typeof(MainWindow).Assembly.GetManifestResourceStream("WebUIExplorer.Inspector.js"))
+        using (var reader = new StreamReader(stream))
+        {
+            return reader.ReadToEnd();
+        }
     }
 }

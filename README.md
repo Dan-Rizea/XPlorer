@@ -10,6 +10,9 @@ It provides a floating, responsive desktop widget that connects to a dedicated C
 
 ### 🔍 Interactive Visual Element Spy
 - **Precision Element Snapping:** Hover over any element on the page with a real-time glowing selection box and click to inspect.
+- **Layer Selection:** Hover over a covering element and use <kbd>Alt</kbd> + mouse wheel or <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> to cycle through elements at that location, including covered inputs and controls with `pointer-events: none`. The badge shows the selected layer.
+- **DOM Navigation:** <kbd>↑</kbd> selects a parent (up to `#document`); <kbd>↓</kbd> selects a child control. This also reaches hidden inputs within a wrapper. Zero-sized controls highlight their wrapper and are marked as hidden. Click or press <kbd>Enter</kbd> to capture; <kbd>Esc</kbd> cancels.
+- **Frame Documents:** Inspect elements inside same-origin, cross-origin, and nested iframe `#document` nodes. Saved actions run in the original tab and frame. Open shadow roots are supported, including nested roots.
 - **Optimized Selector Generation:** Automatically generates stable, robust **XPath** and **CSS** selectors.
 - **Instant Inline Naming:** As soon as an element is captured, the name field is automatically focused with the text highlighted so you can name your selector instantly and press <kbd>Enter</kbd>.
 
@@ -77,6 +80,19 @@ On the first launch, XPlorer will automatically download a dedicated Chromium br
 - **Browser Automation:** [PuppeteerSharp](https://github.com/hardkoded/puppeteer-sharp) (Chrome DevTools Protocol)
 - **UI & Styling:** [Material Design in XAML Toolkit](https://github.com/MaterialDesignInXAML/MaterialDesignInXamlToolkit)
 - **Serialization:** [Newtonsoft.Json](https://www.newtonsoft.com/json)
+
+### Browser regression checks
+
+On Windows, build and run the headless Chromium smoke tests:
+
+```powershell
+dotnet build tests/InspectorSmokeTests.csproj
+& ./tests/bin/Debug/net472/InspectorSmokeTests.exe
+```
+
+The runner defaults to the installed Google Chrome executable. Pass another Chromium executable path as its first argument if needed. It serves temporary local fixtures and runs the original smoke tests plus 86 extended scenarios covering input types, selectors, dynamic DOM changes, dialogs/popovers, SVG/MathML, frame lifecycles, shadow roots, action behavior, cancellation, and large pages.
+
+Use `--app-flags` to reproduce XPlorer's configured browser flags, or `--filter="frame hover"` to run matching extended scenarios. Each complete run writes a browser-specific Markdown report in `tests/`. Tests use headless browsers and never initialize the application's browser-launching WPF startup window.
 
 ---
 

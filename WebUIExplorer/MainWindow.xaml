@@ -270,7 +270,7 @@
                         <Button x:Name="SpyButton" 
                                 Style="{StaticResource WhiteIconBtnStyle}"
                                 Click="SpyButton_Click"
-                                ToolTip="Indicate Element on Webpage">
+                                ToolTip="Indicate Element: Alt+Wheel or Tab cycles layers; Up/Down selects parent/child; Click or Enter captures; Esc cancels.">
                             <materialDesign:PackIcon x:Name="SpyIcon" Kind="CrosshairsGps" Width="15" Height="15" Foreground="#000000"/>
                         </Button>
 

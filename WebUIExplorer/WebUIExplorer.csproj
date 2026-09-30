@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Inspector.js" />
     <PackageReference Include="MaterialDesignThemes" Version="4.9.0" />
     <PackageReference Include="PuppeteerSharp" Version="14.0.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
